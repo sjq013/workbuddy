@@ -32,11 +32,11 @@ cap 2（自我改进）已被 self-improving skill 核心职责覆盖，**hook �
 
 ### 决策 2 — Implementation language = Python
 
-理由：匹配 WorkBuddy 现有 hooks 全 Python；与 binary runtime 一致；self-improving 自带 bash 脚本可作为子进程被 Python 调用，保留上游版本。
+理由：匹配 WorkBuddy 现有 hooks 全 Python；与 binary runtime 一致；self-improving 自带 bash 脚本的 activator/error-detector 语义由 Python 逐字重实现（mirror-of 锚点，详见决策 13），规避 Windows `bash`→wsl.exe 被沙箱拦截。
 
 ### 决策 3 — Hook vs Skill 关系 = 桥接层（bridge）
 
-hook = 薄适配器层；事件 → bash 脚本入口（activator.sh / error-detector.sh）转译；**不持业务逻辑**（升级 / 自改进 / 回滚决策权归 skill 与 runtime）。
+hook = 薄适配器层；事件 → Python 重实现的 activator / error-detector 提醒逻辑（语义 mirror-of 上游 bash 脚本）；**不持业务逻辑**（升级 / 自改进 / 回滚决策权归 skill 与 runtime）。
 
 理由：以 self-improving 为 master；避免双写规则的平行扩展层；hook 是「事件驱动激活层」与 runtime「定时激活层」互补。
 
@@ -90,8 +90,8 @@ hook 自我改参的颗粒度：**仅 trigger frequency（事件触发 debounce 
 ### 决策 11 — Hook-runtime 契约 = 文件系统共享态
 
 三层文件体系 + 文件系统共享态通信：
-- hook 层（`hooks/self_improving_bridge.py`）→ 接收 WorkBuddy 事件 → 调 bash 子进程
-- bash 脚本层（`skills/self-improvement/scripts/{activator,error-detector}.sh`）→ 写 `.learnings/`
+- hook 层（`hooks/self_improving_bridge.py`，Python）→ 接收 WorkBuddy 事件 → 直接注入提醒文本（activator / error-detector 逻辑 Python 重实现）
+- 上游 bash 脚本层（`skills/self-improvement/scripts/{activator,error-detector}.sh`）→ Claude Code / Codex 等环境使用；WorkBuddy 经 Python 重实现复用其语义，不再 subprocess 调 bash
 - runtime 层（`self-improving/`）→ 读 `.learnings/` + `heartbeat-state.md`，靠 `automation_update` 定时
 
 排除：
@@ -104,11 +104,15 @@ hook 自我改参的颗粒度：**仅 trigger frequency（事件触发 debounce 
 
 理由：与 hook 同语言，类型检查免费；JSON/YAML/TOML 都需解析层；Python 配置唯一缺点是不能运行时热改——但 hook 配置通常启动加载，热改需求低。
 
-### 决策 13 — Activator / error-detector 复用 vs 重写 = subprocess 调 bash
+### 决策 13 — Activator / error-detector = Python 重实现（mirror-of 上游 bash 脚本）
 
-hook 通过 `subprocess.run` 调 `activator.sh` / `error-detector.sh`；保留上游实现。
+**2026-09-28 实施修正**：原决策为「subprocess 调 bash 脚本」，实测发现两条阻断后改为 Python 重实现：
+1. 本机 `bash` 解析为 `wsl.exe`（`C:/Program Files/WSL/wsl.exe`），被 WorkBuddy 沙箱拦截 → subprocess 调 bash 永不执行（rc=1、无输出）；
+2. WorkBuddy 的 PostToolUse `tool_response` 仅含元数据（exitCode / stderrBytesTruncated / tool_error_code），**不含 stdout/stderr 文本且 exitCode 恒 0** → error-detector「扫描工具输出」在本平台为 no-op。
 
-理由：以 self-improving 为 master 前提要求保留官方脚本；自动升级时 bash 脚本跟着新版本走，hook 不需感知。
+修正做法：在 bridge（Python 受管运行时，确认不被拦截）内等价重实现两脚本的提醒逻辑，从 `tool_response` 取字段；提醒文本与模式列表与上游 bash 脚本逐字一致（注释锚点 `mirror-of:activator.sh` / `error-detector.sh`）。
+
+理由：以 self-improving 为 master → 语义须与官方脚本对齐；但 Windows 平台不能用 subprocess 调 bash，故改 Python 重实现。**error-detector 逻辑保留不删（KEEP）**——其在 Claude Code 等上游环境能真触发，删则失去跨平台能力，且本平台 no-op 非 bug（平台载荷限制，非 hook 缺陷）。
 
 ### 决策 14 — `.learnings/` first-use init 责任 = Skill 保留
 
@@ -144,6 +148,7 @@ hook 不做去重；activator.sh 设计本就是 lightweight 提醒（hooks-setu
 
 - hook 强耦合 self-improving skill 存在；**未来替换 self-improving skill 时 hook 须同步重写**——这是「以 self-improving 为准」的 trade-off
 - PreToolUse 不订阅 = 失去 PreToolUse 时机的 self-improving 触发（如配置改动前提醒）；如需补回，加 Round 4 grill
+- **平台载荷限制（per LRN-20260928-002）**：WorkBuddy 的 PostToolUse `tool_response` 不含 stdout/stderr 文本且 exitCode 恒 0 → error-detector 自动错误检测在本平台为 no-op；有效自动路径仅 `UserPromptSubmit` activator 提醒 + 白泽自觉落档。此非 hook bug，是平台差异；error-detector 逻辑保留以兼容 Claude Code 等上游环境。
 - 升级失败回滚 = 可能阻塞 skill 工作（fail-safe 副作用）；按 SOUL 硬 Gate 4「审慎」叠加选择
 
 ### 适用范围
@@ -157,7 +162,7 @@ hook 不做去重；activator.sh 设计本就是 lightweight 提醒（hooks-setu
 - **方案 A：Hook 为独立子系统**（含完整升级 / 自改进 / 回滚能力，self-improving 只是目标之一）—— 拒绝。违反「以 self-improving 为准」前提；cap 2 由 skill 自带，hook 重复是反 SSOT。
 - **方案 B：Hook 仅 PreToolUse**（写文件时触发 activator）—— 拒绝。PreToolUse 已被 config-guard / auto_backup 占用；self-improving 推荐事件是 UserPromptSubmit + PostToolUse，强行改 PreToolUse 偏离 skill 设计意图。
 - **方案 C：SessionStart 做升级检测** —— 拒绝。SessionStart 频率高（每次会话），远端拉取消耗大且主人提示疲劳；weekly `automation_update` 足够。
-- **方案 D：Hook 重写 Python 版 activator** —— 拒绝。违反「以 self-improving 为准」；双维护成本高；上游升级时 Python 版要同步改。
+- **方案 D：Hook 重写 Python 版 activator** —— **2026-09-28 改为采纳**（原拒因「双维护成本高」被平台事实推翻）：Windows `bash`→wsl.exe 被沙箱拦截 + PostToolUse 不传工具输出，subprocess 调 bash 实际不可行；Python 重实现以 `mirror-of` 锚点对齐上游语义，上游升级时同步此处注释锚点即可，维护成本可控。
 - **方案 E：Hook 通过 Python import runtime** —— 拒绝。runtime 当前全 .md 无 Python 入口；强加会破坏 SSOT 与分层。
 
 ## Status
@@ -165,7 +170,7 @@ hook 不做去重；activator.sh 设计本就是 lightweight 提醒（hooks-setu
 - ✅ 2026-09-28 设计完成
 - ✅ 2026-09-28 实施完成（smoke test 全过）：
   - `~/.workbuddy/hooks/self_improving_config.py` —— 路径常量 + 配置字典
-  - `~/.workbuddy/hooks/self_improving_bridge.py` —— 事件分支 + bash subprocess + debounce + 日志
+  - `~/.workbuddy/hooks/self_improving_bridge.py` —— 事件分支 + Python 重实现 activator/error-detector 提醒（mirror-of 上游 bash 脚本）+ debounce + 日志
   - `~/.workbuddy/settings.json` `hooks` 块 —— 新增 3 个 hook 入口（UserPromptSubmit + PostToolUse + SessionStart）
   - `.config-routed-settings.json.flag` —— 刷新（mtime 14:42，24h 有效）
   - `~/.workbuddy/self-improving/automation/upgrade-check.json.template` —— weekly cron 模板（status=PAUSED，不启用）

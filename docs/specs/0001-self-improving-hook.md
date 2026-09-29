@@ -20,7 +20,7 @@
 按主人分层原则（ADR 0001 + MEMORY 决策域 2026-09-28 落档的「主动 vs 克制：价值观层 vs 行为准则层」）构建**薄事件桥 hook**：
 
 - hook = adapter pattern，不持业务逻辑
-- 3 类 WorkBuddy 事件 → 调 self-improving 上游 bash 脚本（subprocess 复用）
+- 3 类 WorkBuddy 事件 → 调 self-improving 上游逻辑（Python 重实现，mirror-of 上游 bash 脚本语义；Windows 不适用 subprocess 调 bash）
 - 与 proactive-agent 共享 `.learnings/` 目录作为协同通道
 - HEARTBEAT auto-cleanup / Autonomous Crons 按主人分层原则 **显式禁用**（行为层与白泽硬 Gate 冲突）
 - 升级检测走「weekly `automation_update` + 本地 hash + 远端 clawhub.ai WebFetch」，当前 status=PAUSED 等待触发率证据（per MEMORY 第一性原理第③问强制子项）
@@ -28,10 +28,10 @@
 ## User Stories
 
 1. As 白泽（主人），I want 自改进 reminder 在每次我发消息后注入白泽上下文（UserPromptSubmit → activator.sh），so that 白泽每次会话结束前评估是否要写 .learnings/LEARNINGS.md。
-2. As 白泽，I want 错误检测 reminder 在 Bash 工具调用失败后注入上下文（PostToolUse (Bash) → error-detector.sh），so that 非显然错误自动被白泽看到。
+2. As 白泽，I want 错误检测 reminder 在 Bash 工具调用失败后注入上下文（PostToolUse (Bash) → error-detector 逻辑），so that 非显然错误自动被白泽看到。**平台限制**：WorkBuddy 的 PostToolUse `tool_response` 不含 stdout/stderr 文本且 exitCode 恒 0 → 该提醒在本平台为 no-op；有效自动路径为 `UserPromptSubmit` activator 提醒 + 白泽自觉落档（per LRN-20260928-002）。逻辑保留以兼容 Claude Code 等上游环境。
 3. As 白泽，I want SessionStart 时 hook 写一条 lifecycle log，so that 会话边界有可见记录（不替代功能）。
 4. As 白泽，I want hook config 是 Python 模块而非 JSON / YAML，so that 类型检查免费 + 与 hook 同语言。
-5. As 白泽，I want activator.sh / error-detector.sh 通过 subprocess 复用而非 Python 重写，so that upstream 升级时脚本跟着新版本走，hook 无需感知。
+5. As 白泽，I want activator / error-detector 语义与上游 bash 脚本逐字对齐（mirror-of 锚点），so that upstream 升级时同步注释锚点即可，无需重写逻辑。**实现修正**：Windows `bash`→wsl.exe 被沙箱拦截 + PostToolUse 不传工具输出 → 改为 Python 重实现（非 subprocess 复用）。
 6. As 白泽，I want hook 配置里 60s debounce 抑制重复触发，so that log 不被刷屏。
 7. As 白泽，I want 事件触发场景 hook 失败时 fail-open（exit 0），so that hook 异常不阻塞白泽；升级场景反过来 fail-safe 失败回滚，so that skill 不可用 = 阻塞工作。
 8. As 白泽，I want self-improving 与 proactive-agent 通过 `.learnings/` 共享状态，so that 错题本写的 → 小雷达读 → 下次提前防住（数据驱动接力）。
@@ -58,9 +58,10 @@
 - **Hook 接收 UserPromptSubmit**（T3）
 - **Hook 接收 PostToolUse (Bash)**（T4）
 - **Hook 接收 SessionStart**（T5）
-- **Manual 直接调 activator.sh**（T6）
-- **Manual 直接调 error-detector.sh + 错误模式**（T7）
-- **Manual 直接调 error-detector.sh + 干净输入 → 不输出**（T7b，反面断言）
+- **Manual 直接调 bridge Python（activator 路径）**（T6，替代原 activator.sh）
+- **Manual 喂失败 tool_response 给 bridge（error-detect 路径）**（T7）
+- **Manual 喂干净 tool_response 给 bridge → 不输出**（T7b，反面断言）
+- 注：原 T6/T7「直接调 bash 脚本」已废弃（Windows bash→wsl 被沙箱拦截，改 Python 重实现，见 LRN-20260928-002）
 - **Skill 工具调用 self-improvement**（T8）
 - **Manual 直接 edit .learnings/LEARNINGS.md**（T9）
 - **闭环验证：LRN-20260928-001 在 LEARNINGS.md**（T10）
@@ -79,7 +80,7 @@
 
 #### 决策 5：测试范围
 
-- ✅ **测试了**：hook 文件 / 注册 / 事件分发 / debounce / bash 调用 / Skill 加载 / 文件落档
+- ✅ **测试了**：hook 文件 / 注册 / 事件分发 / debounce / Python 提醒注入（activator + error-detect）/ Skill 加载 / 文件落档
 - ❌ **没测试**：automation_update weekly cron（status=PAUSED，未启）
 - ❌ **没测试**：clawhub.com.au 远端拉取（升级流程未启）
 - ❌ **没测试**：workbuddy 主进程实际调用 hook（session 内事件触发由 IDE 负责）
@@ -96,7 +97,7 @@
 
 #### 决策 3：Hook vs Skill 关系 = 桥接层（bridge）
 
-理由：以 self-improving 为 master；hook 不持业务逻辑，事件转译到 skill 官方脚本入口（activator.sh / error-detector.sh）。
+理由：以 self-improving 为 master；hook 不持业务逻辑，事件转译到 skill 官方脚本语义（Python 重实现，mirror-of 上游 activator.sh / error-detector.sh）。
 
 #### 决策 4：订阅事件 = UserPromptSubmit + PostToolUse (Bash) + SessionStart
 
@@ -134,9 +135,9 @@
 
 理由：与 hook 同语言；类型检查免费。
 
-#### 决策 13：Activator / error-detector 复用 = subprocess 调 bash
+#### 决策 13：Activator / error-detector = Python 重实现（mirror-of 上游 bash 脚本）
 
-理由：以 self-improving 为 master；双维护成本高。
+理由：以 self-improving 为 master → 语义须对齐上游；但 Windows `bash`→wsl.exe 被沙箱拦截 + PostToolUse 不传工具输出，subprocess 调 bash 不可行（详见 ADR 0001 决策 13 + LRN-20260928-002）。error-detector 逻辑保留不删（兼容 Claude Code 等上游环境）。
 
 #### 决策 14：`.learnings/` first-use init = Skill 保留
 
